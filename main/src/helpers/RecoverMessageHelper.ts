@@ -3,7 +3,7 @@ import Telegram from '../client/Telegram';
 import OicqClient from '../client/OicqClient';
 import { Pair } from '../models/Pair';
 import { Api } from 'telegram';
-import { GroupMessage, PrivateMessage } from 'icqq';
+import { GroupMessage, PrivateMessage } from '@icqqjs/icqq';
 import db from '../models/db';
 import { format } from 'date-and-time';
 import lottie from '../constants/lottie';
@@ -102,13 +102,7 @@ export default class {
         let url: string;
         switch (elem.type) {
           case 'text': {
-            let tgs = lottie.getTgsIndex(elem.text);
-            if (tgs === -1) {
-              text += elem.text;
-            }
-            else {
-              useFile(`${tgs}.tgs`, `assets/tgs/tgs${tgs}.tgs`);
-            }
+            text += elem.text;
             break;
           }
           case 'at':

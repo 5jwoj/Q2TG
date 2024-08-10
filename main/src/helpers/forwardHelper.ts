@@ -3,11 +3,12 @@ import { CustomFile } from 'telegram/client/uploads';
 import { base64decode } from 'nodejs-base64';
 import { getLogger } from 'log4js';
 import { Entity } from 'telegram/define';
-import { ForwardMessage } from 'icqq';
+import { ForwardMessage } from '@icqqjs/icqq';
 import { Api } from 'telegram';
 import { imageSize } from 'image-size';
 import env from '../models/env';
 import { md5Hex } from '../utils/hashing';
+import posthog from '../models/posthog';
 
 const log = getLogger('ForwardHelper');
 
@@ -70,6 +71,7 @@ export default {
       }
       catch (err) {
         log.error('解析群公告时出错', err);
+        posthog.capture('解析群公告时出错', { error: err });
         return { type: 'text', text: '[群公告]' };
       }
     }
@@ -85,6 +87,7 @@ export default {
         }
       }
       catch (err) {
+        posthog.capture('解析转发消息时出错', { error: err });
       }
     }
     let appurl: string;
@@ -199,6 +202,12 @@ export default {
     const url = new URL(`${env.WEB_ENDPOINT}/richHeader/${apiKey}/${userId}`);
     // 防止群名片刷新慢
     messageHeader && url.searchParams.set('hash', md5Hex(messageHeader).substring(0, 10));
+    return url.toString();
+  },
+
+  generateTelegramAvatarUrl(instanceId: number, userId: number) {
+    if (!env.WEB_ENDPOINT) return '';
+    const url = new URL(`${env.WEB_ENDPOINT}/telegramAvatar/${instanceId}/${userId}`);
     return url.toString();
   },
 };

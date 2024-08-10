@@ -1,4 +1,4 @@
-import { Friend, Group } from 'icqq';
+import { Friend, Group } from '@icqqjs/icqq';
 import TelegramChat from '../client/TelegramChat';
 import OicqClient from '../client/OicqClient';
 import Telegram from '../client/Telegram';
@@ -8,6 +8,7 @@ import { BigInteger } from 'big-integer';
 import { Pair } from './Pair';
 import { getLogger, Logger } from 'log4js';
 import Instance from './Instance';
+import posthog from './posthog';
 
 export default class ForwardPairs {
   private pairs: Pair[] = [];

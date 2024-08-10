@@ -1,5 +1,6 @@
 import Telegram from '../client/Telegram';
 import {
+  FaceElem,
   Forwardable,
   Group,
   GroupMessageEvent,
@@ -10,7 +11,7 @@ import {
   Quotable,
   segment,
   Sendable,
-} from 'icqq';
+} from '@icqqjs/icqq';
 import { fetchFile, getBigFaceUrl, getImageUrlByMd5, isContainsUrl } from '../utils/urls';
 import { ButtonLike, FileLike } from 'telegram/define';
 import { getLogger, Logger } from 'log4js';
@@ -38,15 +39,20 @@ import { QQMessageSent } from '../types/definitions';
 import ZincSearch from 'zincsearch-node';
 import { speech as AipSpeechClient } from 'baidu-aip-sdk';
 import random from '../utils/random';
-import { escapeXml } from 'icqq/lib/common';
+import { escapeXml } from '@icqqjs/icqq/lib/common';
 import Docker from 'dockerode';
 import ReplyKeyboardHide = Api.ReplyKeyboardHide;
 import env from '../models/env';
 import { CustomFile } from 'telegram/client/uploads';
 import flags from '../constants/flags';
 import BigInteger from 'big-integer';
+import probe from 'probe-image-size';
+import markdownEscape from 'markdown-escape';
+import pastebin from '../utils/pastebin';
+import posthog from '../models/posthog';
 
 const NOT_CHAINABLE_ELEMENTS = ['flash', 'record', 'video', 'location', 'share', 'json', 'xml', 'poke'];
+const IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/apng', 'image/webp', 'image/gif', 'image/bmp', 'image/tiff', 'image/x-icon', 'image/avif', 'image/heic', 'image/heif'];
 
 // noinspection FallThroughInSwitchStatementJS
 export default class ForwardService {
@@ -91,11 +97,43 @@ export default class ForwardService {
         });
       });
     }
+    this.initStickerPack().then(() => this.log.info('Sticker Pack 初始化完成'));
+  }
+
+  private readonly stickerPackMap: Record<keyof typeof lottie.packInfo, Api.Document[]> = {} as any;
+
+  private async initStickerPack() {
+    for (const handle of Object.keys(lottie.packInfo)) {
+      const pack = await this.tgBot.getStickerSet(handle);
+      this.stickerPackMap[handle] = pack.documents;
+    }
+  }
+
+  private getStickerByQQFaceId(id: number) {
+    for (const [pack, ids] of Object.entries(lottie.packInfo)) {
+      if (ids.includes(id as any)) {
+        if (this.stickerPackMap[pack])
+          return this.stickerPackMap[pack][ids.indexOf(id)] as Api.Document;
+      }
+    }
+  }
+
+  private getFaceByTgFileId(fileId: BigInteger.BigNumber): FaceElem | undefined {
+    for (const [pack, documents] of Object.entries(this.stickerPackMap)) {
+      for (const document of documents) {
+        if (document.id.eq(fileId))
+          return {
+            type: 'face',
+            id: lottie.packInfo[pack][documents.indexOf(document)],
+            stickerType: 1,
+          };
+      }
+    }
   }
 
   public async forwardFromQq(event: PrivateMessageEvent | GroupMessageEvent, pair: Pair) {
+    const tempFiles: FileResult[] = [];
     try {
-      const tempFiles: FileResult[] = [];
       let message = '',
         files: FileLike[] = [],
         buttons: ButtonLike[] = [],
@@ -126,7 +164,8 @@ export default class ForwardService {
             const messages = await pair.qq.getForwardMsg(resId);
             message = helper.generateForwardBrief(messages);
             const hash = md5Hex(resId);
-            buttons.push(Button.url('📃查看', `${env.CRV_API}/?hash=${hash}`));
+            const viewerUrl = env.CRV_VIEWER_APP ? `${env.CRV_VIEWER_APP}?startapp=${hash}` : `${env.CRV_API}/?hash=${hash}`;
+            buttons.push(Button.url('📃查看', viewerUrl));
             // 传到 Cloudflare
             axios.post(`${env.CRV_API}/add`, {
               auth: env.CRV_KEY,
@@ -134,9 +173,13 @@ export default class ForwardService {
               data: messages,
             })
               .then(data => this.log.trace('上传消息记录到 Cloudflare', data.data))
-              .catch(e => this.log.error('上传消息记录到 Cloudflare 失败', e));
+              .catch(e => {
+                this.log.error('上传消息记录到 Cloudflare 失败', e);
+                posthog.capture('上传消息记录到 Cloudflare 失败', { error: e });
+              });
           }
           catch (e) {
+            posthog.capture('转发多条消息（无法获取）', { error: e });
             message = '[<i>转发多条消息（无法获取）</i>]';
           }
         }
@@ -144,7 +187,14 @@ export default class ForwardService {
           message = '[<i>转发多条消息（未配置）</i>]';
         }
       };
-      for (const elem of event.message) {
+      for (let elem of event.message) {
+        if (elem.type === 'flash' && (pair.flags | this.instance.flags) & flags.NO_FLASH_PIC) {
+          message += '<i>[闪照]</i>';
+          elem = {
+            ...elem,
+            type: 'image',
+          };
+        }
         let url: string;
         switch (elem.type) {
           case 'text': {
@@ -156,14 +206,7 @@ export default class ForwardService {
               instantViewUrl.searchParams.set('rhash', '45756f9b0bb3c6');
               message += `<a href="${instantViewUrl}">\u200e</a>`;
             }
-            // 判断 tgs 表情
-            let tgs = lottie.getTgsIndex(elem.text);
-            if (tgs === -1) {
-              message += helper.htmlEscape(elem.text);
-            }
-            else {
-              useSticker(`assets/tgs/tgs${tgs}.tgs`);
-            }
+            message += helper.htmlEscape(elem.text);
             break;
           }
           case 'at': {
@@ -175,7 +218,16 @@ export default class ForwardService {
             }
           }
           case 'face':
+            // 判断 tgs 表情
+            const tgs = this.getStickerByQQFaceId(elem.id as number);
+            if (tgs) {
+              useSticker(tgs);
+              break;
+            }
           case 'sface': {
+            if (!elem.text) {
+              elem.text = '表情:' + elem.id;
+            }
             message += `[<i>${helper.htmlEscape(elem.text)}</i>]`;
             break;
           }
@@ -211,6 +263,7 @@ export default class ForwardService {
             }
             catch (e) {
               this.log.error('下载媒体失败', e);
+              posthog.capture('下载媒体失败', { error: e });
               // 下载失败让 Telegram 服务器下载
               files.push(url);
             }
@@ -244,6 +297,7 @@ export default class ForwardService {
               }
               catch (e) {
                 this.log.error('下载媒体失败', e);
+                posthog.capture('下载媒体失败', { error: e });
                 // 下载失败让 Telegram 服务器下载
                 files.push(url);
               }
@@ -313,6 +367,7 @@ export default class ForwardService {
                 }
                 catch (e) {
                   this.log.error('下载媒体失败', e);
+                  posthog.capture('下载媒体失败', { error: e });
                   // 下载失败让 Telegram 服务器下载
                   files.push(getImageUrlByMd5(result.md5));
                 }
@@ -365,6 +420,7 @@ export default class ForwardService {
         }
         catch (e) {
           this.log.error('查找回复消息失败', e);
+          posthog.capture('查找回复消息失败', { error: e });
           message += '\n\n<i>*查找回复消息失败</i>';
         }
       }
@@ -386,9 +442,9 @@ export default class ForwardService {
       else if (files.length) {
         messageToSend.file = files;
       }
-      else if (event.message_type === 'group' && (pair.flags | this.instance.flags) & flags.RICH_HEADER && env.WEB_ENDPOINT 
-      // 当消息包含链接时不显示 RICH HEADER
-      && !isContainsUrl(message)) {
+      else if (event.message_type === 'group' && (pair.flags | this.instance.flags) & flags.RICH_HEADER && env.WEB_ENDPOINT
+        // 当消息包含链接时不显示 RICH HEADER
+        && !isContainsUrl(message)) {
         // 没有文件时才能显示链接预览
         richHeaderUsed = true;
         // https://github.com/tdlib/td/blob/437c2d0c6e0ad104022d5ad86ddc8aedc41cb7a8/td/telegram/MessageContent.cpp#L2575
@@ -418,6 +474,7 @@ export default class ForwardService {
         if (richHeaderUsed) {
           richHeaderUsed = false;
           this.log.warn('Rich Header 发送错误', messageToSend.file, e);
+          posthog.capture('Rich Header 发送错误', { error: e, attach: messageToSend.file });
           delete messageToSend.file;
           delete messageToSend.linkPreview;
           message = messageHeader + (message && messageHeader ? '\n' : '') + message;
@@ -447,26 +504,41 @@ export default class ForwardService {
       if (this.instance.workMode === 'personal' && event.message_type === 'group' && event.atall) {
         await tgMessage.pin({ notify: false });
       }
-
-      tempFiles.forEach(it => it.cleanup());
       return { tgMessage, richHeaderUsed };
     }
     catch (e) {
       this.log.error('从 QQ 到 TG 的消息转发失败', e);
+      posthog.capture('从 QQ 到 TG 的消息转发失败', { error: e });
+      let pbUrl: string;
       try {
-        this.instance.workMode === 'personal' && await pair.tg.sendMessage('<i>有一条来自 QQ 的消息转发失败</i>');
+        pbUrl = await pastebin.upload(JSON.stringify({
+          error: e,
+          event,
+        }));
+      }
+      catch (e) {
+        this.log.error('上传到 Pastebin 失败', e);
+      }
+      try {
+        this.instance.workMode === 'personal' && await pair.tg.sendMessage({
+          message: '<i>有一条来自 QQ 的消息转发失败</i>',
+          buttons: pbUrl ? [[Button.url('查看详情', pbUrl)]] : [],
+        });
       }
       catch {
       }
       return {};
     }
+    finally {
+      tempFiles.forEach(it => it.cleanup());
+    }
   }
 
   public async forwardFromTelegram(message: Api.Message, pair: Pair): Promise<Array<QQMessageSent>> {
-    // console.log(message);
     try {
       const tempFiles: FileResult[] = [];
-      let chain: Sendable = [];
+      let chain: (string | MessageElem)[] = [];
+      let markdown: string[] = [], markdownCompatible = true;
       const senderId = Number(message.senderId || message.sender?.id);
       // 这条消息在 tg 中被回复的时候显示的
       let brief = '', isSpoilerPhoto = false;
@@ -475,14 +547,37 @@ export default class ForwardService {
           // 要是隐私设置了，应该会有这个，然后下面两个都获取不到
           (message.fwdFrom?.fromName ||
             helper.getUserDisplayName(await message.forward.getChat() || await message.forward.getSender())) :
-          '') +
-        ': \n';
+          '');
+      markdown.push(`![头像 #30px#30px](${helper.generateTelegramAvatarUrl(this.instance.id, senderId)}) **${messageHeader}**`);
+      messageHeader += ': \n';
       if ((pair.flags | this.instance.flags) & flags.COLOR_EMOJI_PREFIX) {
-        messageHeader = emoji.tgColor((message.sender as Api.User)?.color || message.senderId.toJSNumber()) + messageHeader;
+        messageHeader = emoji.tgColor((message.sender as Api.User)?.color?.color || message.senderId.toJSNumber()) + messageHeader;
       }
+
+      const useImage = (image: Buffer, asface: boolean) => {
+        const md5 = md5Hex(image);
+        const dimensions = probe.sync(image);
+        let width = dimensions.width;
+        let height = dimensions.height;
+        if (asface) {
+          width /= 2;
+          height /= 2;
+        }
+        markdown.push(`![image #${width}px#${height}px](${getImageUrlByMd5(md5)})`);
+        chain.push({
+          type: 'image',
+          file: image,
+          asface,
+        });
+      };
+      const useText = (text: string) => {
+        markdown.push(markdownEscape(text));
+        chain.push(text);
+      };
+
       if (message.photo instanceof Api.Photo ||
         // stickers 和以文件发送的图片都是这个
-        message.document?.mimeType?.startsWith('image/')) {
+        IMAGE_MIMES.includes(message.document?.mimeType)) {
         if ('spoiler' in message.media && message.media.spoiler) {
           isSpoilerPhoto = true;
           const msgList: Forwardable[] = [{
@@ -517,13 +612,10 @@ export default class ForwardService {
 ></item><source name="Q2TG" icon="" action="" appid="-1" /></msg>`.replaceAll('\n', ''),
           });
           brief += '[Spoiler 图片]';
+          markdownCompatible = false;
         }
         else {
-          chain.push({
-            type: 'image',
-            file: await message.downloadMedia({}),
-            asface: !!message.sticker,
-          });
+          useImage(await message.downloadMedia({}) as Buffer, !!message.sticker);
           brief += '[图片]';
         }
       }
@@ -535,28 +627,30 @@ export default class ForwardService {
         else if (file.mimeType === 'video/webm' || message.gif) {
           // 把 webm 转换成 gif
           const convertedPath = await convert.webm2gif(message.document.id.toString(16), () => message.downloadMedia({}));
-          chain.push({
-            type: 'image',
-            file: convertedPath,
-            asface: true,
-          });
+          // markdown 里的 gif 不能动
+          markdownCompatible = false;
+          useImage(await fsP.readFile(convertedPath), true);
         }
         else {
           const temp = await createTempFile();
           tempFiles.push(temp);
           await fsP.writeFile(temp.path, await message.downloadMedia({}));
           chain.push(segment.video(temp.path));
+          markdownCompatible = false;
         }
         brief += '[视频]';
       }
       else if (message.sticker) {
         // 一定是 tgs
-        const gifPath = await convert.tgs2gif(message.sticker.id.toString(16), () => message.downloadMedia({}));
-        chain.push({
-          type: 'image',
-          file: gifPath,
-          asface: true,
-        });
+        const face = this.getFaceByTgFileId(message.sticker.id);
+        if (face) {
+          chain.push(face);
+        }
+        else {
+          const gifPath = await convert.tgs2gif(message.sticker.id.toString(16), () => message.downloadMedia({}));
+          useImage(await fsP.readFile(gifPath), true);
+        }
+        markdownCompatible = false;
         brief += '[贴纸]';
       }
       else if (message.voice) {
@@ -565,6 +659,7 @@ export default class ForwardService {
         await fsP.writeFile(temp.path, await message.downloadMedia({}));
         const bufSilk = await silk.encode(temp.path);
         chain.push(segment.record(bufSilk));
+        markdownCompatible = false;
         if (this.speechClient) {
           const pcmPath = await createTempFile({ postfix: '.pcm' });
           tempFiles.push(pcmPath);
@@ -585,13 +680,14 @@ export default class ForwardService {
       }
       else if (message.poll) {
         const poll = message.poll.poll;
-        chain.push(`${poll.multipleChoice ? '多' : '单'}选投票：\n${poll.question}`);
-        chain.push(...poll.answers.map(answer => `\n - ${answer.text}`));
+        useText(`${poll.multipleChoice ? '多' : '单'}选投票：\n${poll.question}`);
+        chain.push('\n');
+        useText(poll.answers.map(answer => ` - ${answer.text}`).join('\n'));
         brief += '[投票]';
       }
       else if (message.contact) {
         const contact = message.contact;
-        chain.push(`名片：\n` +
+        useText(`名片：\n` +
           contact.firstName + (contact.lastName ? ' ' + contact.lastName : '') +
           (contact.phoneNumber ? `\n电话：${contact.phoneNumber}` : ''));
         brief += '[名片]';
@@ -601,22 +697,25 @@ export default class ForwardService {
         const geo: { lat: number, lng: number } = eviltransform.wgs2gcj(message.venue.geo.lat, message.venue.geo.long);
         chain.push(segment.location(geo.lat, geo.lng, `${message.venue.title} (${message.venue.address})`));
         brief += `[位置：${message.venue.title}]`;
+        markdownCompatible = false;
       }
       else if (message.geo instanceof Api.GeoPoint) {
         // 普通的位置，没有名字
         const geo: { lat: number, lng: number } = eviltransform.wgs2gcj(message.geo.lat, message.geo.long);
         chain.push(segment.location(geo.lat, geo.lng, '选中的位置'));
         brief += '[位置]';
+        markdownCompatible = false;
       }
       else if (message.media instanceof Api.MessageMediaDocument && message.media.document instanceof Api.Document) {
         const file = message.media.document;
         const fileNameAttribute =
           file.attributes.find(attribute => attribute instanceof Api.DocumentAttributeFilename) as Api.DocumentAttributeFilename;
-        chain.push(`文件：${fileNameAttribute ? fileNameAttribute.fileName : ''}\n` +
+        useText(`文件：${fileNameAttribute ? fileNameAttribute.fileName : ''}\n` +
           `类型：${file.mimeType}\n` +
           `大小：${file.size}`);
         if (file.size.leq(50 * 1024 * 1024)) {
-          chain.push('\n文件正在上传中…');
+          chain.push('\n');
+          useText('文件正在上传中…');
           if (pair.qq instanceof Group) {
             pair.qq.fs.upload(await message.downloadMedia({}), '/',
               fileNameAttribute ? fileNameAttribute.fileName : 'file')
@@ -653,29 +752,32 @@ export default class ForwardService {
           }
           chain.push(messageLeft, ...newChain);
           brief += message.message;
+          markdown.push(markdownEscape(message.message));
         }
         // Q2TG Bot 转发的消息目前不会包含 custom emoji
         else if (message.forward?.senderId?.eq?.(this.tgBot.me.id) && /^.*: ?$/.test(message.message.split('\n')[0])) {
           // 复读了某一条来自 QQ 的消息 (Repeat as forward)
           const originalMessage = message.message.includes('\n') ?
             message.message.substring(message.message.indexOf('\n') + 1) : '';
-          chain.push(originalMessage);
+          useText(originalMessage);
           brief += originalMessage;
 
           messageHeader = helper.getUserDisplayName(message.sender) + ' 转发自 ' +
             message.message.substring(0, message.message.indexOf(':')) + ': \n';
         }
         else {
-          chain.push(message.message);
+          useText(message.message);
           brief += message.message;
         }
       }
 
       // 处理回复
       let source: Quotable;
-      if (message.replyToMsgId) {
+      if (message.replyToMsgId || message.replyTo) {
+        markdownCompatible = false;
         try {
-          const quote = await db.message.findFirst({
+          console.log(message.replyTo);
+          const quote = message.replyToMsgId && await db.message.findFirst({
             where: {
               tgChatId: Number(pair.tg.id),
               tgMsgId: message.replyToMsgId,
@@ -684,7 +786,7 @@ export default class ForwardService {
           });
           if (quote) {
             source = {
-              message: quote.brief || ' ',
+              message: message.replyTo?.quoteText || quote.brief || ' ',
               seq: quote.seq,
               rand: Number(quote.rand),
               user_id: Number(quote.qqSenderId),
@@ -693,7 +795,7 @@ export default class ForwardService {
           }
           else {
             source = {
-              message: '回复消息找不到',
+              message: message.replyTo?.quoteText || '回复消息找不到',
               seq: 1,
               time: Math.floor(new Date().getTime() / 1000),
               rand: 1,
@@ -703,6 +805,7 @@ export default class ForwardService {
         }
         catch (e) {
           this.log.error('查找回复消息失败', e);
+          posthog.capture('查找回复消息失败', { error: e });
           source = {
             message: '查找回复消息失败',
             seq: 1,
@@ -726,6 +829,7 @@ export default class ForwardService {
         && chainableElements.length
         && this.instance.workMode
         && pair.instanceMapForTg[senderId]
+        && !((pair.flags | this.instance.flags) & flags.DISABLE_SEAMLESS)
       ) {
         try {
           const messageSent = await pair.instanceMapForTg[senderId].sendMsg([
@@ -748,11 +852,18 @@ export default class ForwardService {
         }
         catch (e) {
           this.log.error('使用 MapInstance 发送消息失败', e);
+          posthog.capture('使用 MapInstance 发送消息失败', { error: e });
         }
       }
 
       if (this.instance.workMode === 'group' && !isSpoilerPhoto) {
         chainableElements.unshift(messageHeader);
+        if (markdownCompatible && (pair.flags | this.instance.flags) & flags.USE_MARKDOWN) {
+          chainableElements.push({
+            type: 'markdown',
+            content: markdown.join('\n'),
+          });
+        }
       }
       const qqMessages = [] as Array<QQMessageSent>;
       if (chainableElements.length) {
@@ -763,8 +874,13 @@ export default class ForwardService {
             eqq: { type: 'tg', tgUid: senderId, noSplitSender: this.instance.workMode === 'personal', version: 2 },
           }, undefined, 0),
         });
+        let messageToSend: Sendable = chainableElements;
+        if (chainableElements.some(it => typeof it === 'object' && it.type === 'markdown')) {
+          this.log.debug(chainableElements);
+          messageToSend = await pair.qq.uploadLongMsg(chainableElements);
+        }
         qqMessages.push({
-          ...await pair.qq.sendMsg(chainableElements, source),
+          ...await pair.qq.sendMsg(messageToSend, source),
           brief,
           senderId: this.oicq.uin,
         });
@@ -783,6 +899,7 @@ export default class ForwardService {
     }
     catch (e) {
       this.log.error('从 TG 到 QQ 的消息转发失败', e);
+      posthog.capture('从 TG 到 QQ 的消息转发失败', { error: e });
       try {
         await message.reply({
           message: `<i>转发失败：${e.message}</i>`,

@@ -43,8 +43,8 @@ services:
       - zinclabs
       - sign
     ports:
-      # 如果要使用 RICH_HEADER 取消注释并将端口发布到公网 
-      #- 8080:8080
+      # 如果要使用 RICH_HEADER 需要将端口发布到公网 
+      - 8080:8080
     volumes:
       - q2tg:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
